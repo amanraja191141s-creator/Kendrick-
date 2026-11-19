@@ -1,0 +1,184 @@
+name: Sable Calculator v100.0 — Android APK
+
+'on':
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sable-android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-build:
+    name: Verify Sable source and build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install required Android SDK packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+          test -d "$ANDROID_HOME/platforms/android-35"
+          test -d "$ANDROID_HOME/build-tools/35.0.0"
+
+      - name: Locate Sable source (repository root or uploaded ZIP)
+        id: source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          EXPECTED_VERSION='2.00.0-v100.0'
+          APP_DIR=''
+
+          if [ -f package.json ]; then
+            ROOT_VERSION="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json','utf8')).version")"
+            if [ "$ROOT_VERSION" = "$EXPECTED_VERSION" ]; then
+              APP_DIR="$GITHUB_WORKSPACE"
+            else
+              echo "::warning::Repository root contains version '$ROOT_VERSION', not Sable $EXPECTED_VERSION; checking for the release ZIP."
+            fi
+          fi
+
+          if [ -z "$APP_DIR" ]; then
+            mapfile -t ARCHIVES < <(find . -maxdepth 5 -type f -name 'Sable-Calculator-v100.0-Clean-Rebuild.zip' -not -path '*/node_modules/*' -print)
+            if [ "${#ARCHIVES[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one Sable-Calculator-v100.0-Clean-Rebuild.zip, or the extracted Sable project at repository root. Found ${#ARCHIVES[@]}."
+              echo 'Upload the complete ZIP to the repository root, or upload the extracted project contents (including package.json and .github/workflows/main.yml) to the repository root.'
+              exit 1
+            fi
+            ARCHIVE="${ARCHIVES[0]}"
+            unzip -tq "$ARCHIVE"
+            EXTRACT_DIR="$RUNNER_TEMP/sable-calculator-v100.0"
+            rm -rf "$EXTRACT_DIR"
+            mkdir -p "$EXTRACT_DIR"
+            unzip -q "$ARCHIVE" -d "$EXTRACT_DIR"
+            mapfile -t PACKAGES < <(find "$EXTRACT_DIR" -type f -name package.json -not -path '*/node_modules/*' -not -path '*/www/*' -print)
+            if [ "${#PACKAGES[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one application package.json in the Sable ZIP; found ${#PACKAGES[@]}."
+              exit 1
+            fi
+            APP_DIR="$(dirname "${PACKAGES[0]}")"
+            ZIP_VERSION="$(node -p "JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8')).version" "$APP_DIR/package.json")"
+            if [ "$ZIP_VERSION" != "$EXPECTED_VERSION" ]; then
+              echo "::error::ZIP release mismatch: expected $EXPECTED_VERSION, found $ZIP_VERSION."
+              exit 1
+            fi
+          fi
+
+          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+          echo "Selected Sable source: $APP_DIR"
+
+      - name: Verify release identity and required project files
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const html = fs.readFileSync('index.html', 'utf8');
+          const manifest = JSON.parse(fs.readFileSync('manifest.webmanifest', 'utf8'));
+          const capacitor = JSON.parse(fs.readFileSync('capacitor.config.json', 'utf8'));
+          if (pkg.name !== 'sable-calculator' || pkg.version !== '2.00.0-v100.0') throw new Error('Wrong project identity or release version.');
+          if (!html.includes(pkg.version) || manifest.name !== 'Sable Calculator') throw new Error('HTML / manifest release identity mismatch.');
+          if (capacitor.appId !== 'com.sable.calculator' || capacitor.webDir !== 'www') throw new Error('Capacitor appId or webDir mismatch.');
+          const required = [
+            'index.html', 'package.json', 'capacitor.config.json', 'manifest.webmanifest',
+            'assets/css/app.css', 'assets/js/app.js', 'assets/js/sable-calculators.js',
+            'assets/js/localization.js', 'assets/js/currency-localized-names.js',
+            'assets/js/theme-bootstrap.js', 'service-worker.js',
+            'scripts/prepare-android-web.mjs', 'scripts/patch-android-native.mjs',
+            'assets/brand/android-icons/drawable/ic_launcher_foreground.png'
+          ];
+          for (const file of required) if (!fs.existsSync(file) || !fs.statSync(file).size) throw new Error(`Missing or empty required file: ${file}`);
+          if ((html.match(/data-tool-screen=/g) || []).length !== 23) throw new Error('Expected exactly 23 calculator tool destinations.');
+          if (!fs.readFileSync('assets/css/app.css', 'utf8').includes('SABLE v100.0')) throw new Error('Sable design system stylesheet missing.');
+          console.log(`Verified ${pkg.name} ${pkg.version}; 23 tool destinations; Capacitor ${capacitor.appId}.`);
+          NODE
+
+      - name: Install project dependencies
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: npm install --no-audit --no-fund --prefer-offline
+
+      - name: Verify Capacitor dependency tree
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: npm ls --depth=0
+
+      - name: Run full regression suite
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: npm test
+
+      - name: Build and verify Android web assets
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm run build:web
+          test -s www/index.html
+          test -s www/assets/css/app.css
+          test -s www/assets/js/app.js
+          test -s www/assets/js/sable-calculators.js
+
+      - name: Add Android platform if missing
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ ! -f android/gradlew ]; then npx cap add android; fi
+          test -x android/gradlew || chmod +x android/gradlew
+          test -f android/app/src/main/AndroidManifest.xml
+          test -f android/app/build.gradle || test -f android/app/build.gradle.kts
+
+      - name: Apply Sable native branding and system-bar handling
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: npm run android:brand
+
+      - name: Build and validate debug APK
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm run android:apk
+          APK='android/app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+          APK_BYTES="$(stat -c '%s' "$APK")"
+          if [ "$APK_BYTES" -lt 100000 ]; then
+            echo "::error::APK is unexpectedly small ($APK_BYTES bytes)."
+            exit 1
+          fi
+          echo "APK generated successfully: $APK_BYTES bytes"
+
+      - name: Upload Sable Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sable-Calculator-v100.0-debug-apk
+          path: ${{ steps.source.outputs.app_dir }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
